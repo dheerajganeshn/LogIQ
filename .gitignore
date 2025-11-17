@@ -1,0 +1,8 @@
+# Ignore real or local logs
+*.log
+sample-logs/
+real-logs/
+
+# Ignore generated reports
+*.json
+*.html
