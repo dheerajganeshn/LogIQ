@@ -1,283 +1,562 @@
+<#
+=====================================================================================
+ LOGIQ — ENTERPRISE LOG ANALYZER
+-------------------------------------------------------------------------------------
+ This script analyzes ANY kind of application logs:
+ - POS logs (7POS, SCO, Retail)
+ - JSON logs (Datadog, ELK, Splunk)
+ - Windows / Server logs
+ - API performance logs
+ - Kubernetes / Docker logs when redirected to files
 
+ It extracts:
+ - Errors & stack traces
+ - Timeouts
+ - Slow APIs (durationMs or completeReqTTms)
+ - Correlation IDs
+ - Service health failures
+ - JSON structured logs (Datadog/ELK/Splunk)
+ - Error grouping
+ - Latency percentiles (P50, P90, P99)
+ - HTML, JSON and CSV reports
+
+ It also supports real-time tailing:  ./logiq.ps1 -LogPath app.log -Tail
+
+=====================================================================================
+#>
 
 param(
-    # Path to the folder that contains log files to analyze.
-    # Default is .\sample-logs relative to where this script is run.
-    [string]$LogPath = ".\sample-logs",
-
-    # Switch to control whether a JSON report file should be generated.
+    # Path to either a single log file or a directory containing .log files
+    [string]$LogPath = ".",
+    # Whether to output a JSON summary report
     [switch]$JsonReport,
-
-    # Switch to control whether an HTML report file should be generated.
+    # Whether to output a styled HTML dashboard
     [switch]$HtmlReport,
-
-    # Switch to control CSV export
-    [switch]$CsvReport
+    # Enable real-time streaming analysis (no final report, just processing as logs arrive)
+    [switch]$Tail
 )
 
-# Print a simple banner so the user knows the tool that is running.
-Write-Host "======================================================" -ForegroundColor Cyan
-Write-Host "                LogIQ – Enterprise Log Analyzer        " -ForegroundColor Green
-Write-Host "======================================================" -ForegroundColor Cyan
+Write-Host "`n🔍 Starting LogIQ Enterprise Log Analyzer..." -ForegroundColor Cyan
 
-# -------------------------
-# Helper Functions
-# -------------------------
+# -----------------------------------------------------------------------------------
+# 1. INITIALIZE BUCKETS & REGEX PATTERNS
+#    These script-scope variables hold everything we extract from logs.
+# -----------------------------------------------------------------------------------
 
-function Add-ToMap {
+# Will store raw error lines
+$script:errors = @()
+# Will store timeout-related lines
+$script:timeouts = @()
+# Will store “slow API” entries (with duration and line)
+$script:slowApis = @()
+# Map of correlationId -> list of log lines containing that ID
+$script:correlationMap = @{}
+# Placeholder if later you want transaction analysis
+$script:transactions = @()
+# Lines that indicate unhealthy services / connectivity issues
+$script:serviceHealth = @()
+# Parsed JSON objects from JSON logs (Datadog/ELK/etc.)
+$script:jsonEntries = @()
+
+# Regex to detect errors in plain text
+$script:regexError = "ERROR|Exception|Traceback"
+# Regex to detect timeouts
+$script:regexTimeout = "timeout|Timedout|SCREEN_TIMEDOUT"
+# Regex to capture numeric value from completeReqTTms="644"
+$script:regexApi = 'completeReqTTms="(\d+)"'
+# Regex to detect UUID-style correlation IDs
+$script:regexCorrelation = '\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'
+
+# -----------------------------------------------------------------------------------
+# 2. PER-LINE PROCESSOR
+#    This function does all logic for a SINGLE log line.
+#    It is reused by both batch mode and tail mode.
+# -----------------------------------------------------------------------------------
+
+function Process-Line {
     param(
-        [string]$key,
-        [string]$line,
-        [hashtable]$map
-    )
-    if (-not $map.ContainsKey($key)) {
-        $map[$key] = @()
-    }
-    $map[$key] += $line
-}
-
-function Is-SlowApi {
-    param([int]$ms)
-    return $ms -gt 300
-}
-
-function Write-DebugLine {
-    param([string]$msg)
-    # Toggle debug logs here if needed
-    # Write-Host "DEBUG: $msg"
-}
-
-function Build-LogiqHtml {
-    param(
-        [PSCustomObject]$Report,
-        [string[]]$Errors,
-        [string[]]$Timeouts,
-        [string[]]$SlowApis,
-        [string[]]$ServiceHealth
+        [string]$line  # raw log line
     )
 
-    $errorsBlock        = ($Errors        -join "`n")
-    $timeoutsBlock      = ($Timeouts      -join "`n")
-    $slowApisBlock      = ($SlowApis      -join "`n")
-    $serviceHealthBlock = ($ServiceHealth -join "`n")
+    # Skip empty lines
+    if (-not $line) { return }
 
-    $timestamp       = $Report.Timestamp
-    $totalLines      = $Report.TotalLines
-    $errorCount      = $Report.ErrorCount
-    $timeoutCount    = $Report.TimeoutCount
-    $slowApiCount    = $Report.SlowApiCount
-    $txnCount        = $Report.Transactions
-    $corrCount       = $Report.CorrelationIDs
-    $svcHealthIssues = $Report.ServiceHealthIssues
+    # -------------------------
+    # A. JSON LOG HANDLING
+    # -------------------------
+    # If a line looks like JSON (starts with "{"), we try to parse it.
+    if ($line.Trim().StartsWith("{")) {
+        try {
+            $jsonObj = $line | ConvertFrom-Json
+            # Store JSON object for possible future queries
+            $script:jsonEntries += $jsonObj
 
-    $html = @"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<title>LogIQ – Log Analysis Report</title>
-<style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #0f172a; color: #e5e7eb; margin:0; padding:0; }
-    .header { padding: 24px 32px; background: linear-gradient(90deg,#0ea5e9,#6366f1); color:white; font-size:26px; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.3);}    
-    .subheader { padding:0 32px 16px 32px; font-size:14px; color:#cbd5ff; }
-    .container { padding:20px 32px 32px 32px; }
-    .kpi-grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(160px,1fr)); gap:16px; margin-bottom:28px; }
-    .kpi-card { padding:14px; border-radius:12px; background:#020617; border:1px solid #1e293b; box-shadow:0 1px 3px rgba(0,0,0,0.4);}    
-    .kpi-label { font-size:12px; text-transform:uppercase; letter-spacing:0.06em; color:#9ca3af; margin-bottom:6px; }
-    .kpi-value { font-size:22px; font-weight:600; }
-    .kpi-error { color:#f87171; }
-    .kpi-timeout { color:#fb923c; }
-    .kpi-slow { color:#fde047; }
-    .kpi-ok { color:#4ade80; }
-    details { margin-bottom:14px; border-radius:8px; background:#020617; border:1px solid #1e293b; overflow:hidden; }
-    summary { padding:12px; cursor:pointer; font-size:14px; background:#020617; }
-    summary span.badge { display:inline-block; margin-left:10px; font-size:12px; padding:2px 8px; border-radius:999px; background:#1e293b; color:#e5e7eb; }
-    pre { margin:0; padding:14px; font-size:12px; line-height:1.45; white-space:pre-wrap; background:#020617; border-top:1px solid #1f2937; }
-</style>
-</head>
-<body>
-<div class="header">LogIQ – Log Analysis Report</div>
-<div class="subheader">Generated at $timestamp</div>
+            # Treat JSON logs as error if they have level=error or HTTP status=500
+            if ($jsonObj.level -eq "error" -or $jsonObj.status -eq 500) {
+                $script:errors += $line
+            }
 
-<div class="container">
-    <div class="kpi-grid">
-        <div class="kpi-card"><div class="kpi-label">Total Lines</div><div class="kpi-value kpi-ok">$totalLines</div></div>
-        <div class="kpi-card"><div class="kpi-label">Errors</div><div class="kpi-value kpi-error">$errorCount</div></div>
-        <div class="kpi-card"><div class="kpi-label">Timeouts</div><div class="kpi-value kpi-timeout">$timeoutCount</div></div>
-        <div class="kpi-card"><div class="kpi-label">Slow APIs</div><div class="kpi-value kpi-slow">$slowApiCount</div></div>
-        <div class="kpi-card"><div class="kpi-label">Transactions</div><div class="kpi-value kpi-ok">$txnCount</div></div>
-        <div class="kpi-card"><div class="kpi-label">Correlation IDs</div><div class="kpi-value kpi-ok">$corrCount</div></div>
-        <div class="kpi-card"><div class="kpi-label">Service Health Issues</div><div class="kpi-value kpi-error">$svcHealthIssues</div></div>
-    </div>
+            # Some logs use durationMs for latency; classify slow ones > 300ms
+            if ($jsonObj.PSObject.Properties.Name -contains "durationMs") {
+                if ([int]$jsonObj.durationMs -gt 300) {
+                    $script:slowApis += "$($jsonObj.durationMs) ms : $line"
+                }
+            }
 
-    <details open><summary>Errors <span class="badge">$errorCount</span></summary><pre>$errorsBlock</pre></details>
-    <details><summary>Timeouts <span class="badge">$timeoutCount</span></summary><pre>$timeoutsBlock</pre></details>
-    <details><summary>Slow APIs <span class="badge">$slowApiCount</span></summary><pre>$slowApisBlock</pre></details>
-    <details><summary>Service Health Issues <span class="badge">$svcHealthIssues</span></summary><pre>$serviceHealthBlock</pre></details>
-</div>
-</body>
-</html>
-"@
-
-    return $html
-}
-
-# -------------------------
-# 1. Load all logs
-# -------------------------
-# Get all files under $LogPath with extension .log (recursively), then read their contents.
-# Get-ChildItem finds files; ForEach-Object + Get-Content reads every line from each file.
-$logs = Get-ChildItem -Path $LogPath -Filter *.log -Recurse -File |
-        ForEach-Object { Get-Content -Raw $_.FullName } |
-        ForEach-Object { $_ -split "`n" }
-
-# -------------------------
-# 2. Initialize result buckets
-# -------------------------
-# These arrays will store the filtered lines we care about:
-# - $errors: lines with ERROR
-# - $timeouts: lines that indicate screen/API timeouts
-# - $slowApis: lines for slow API calls above a threshold
-# - $transactions: lines related to transactions (SALE, totals, payment)
-# - $correlationMap: maps correlationId -> list of lines with that ID
-# - $serviceHealth: lines that indicate service failures or unhealthy states
-$errors = @()
-$timeouts = @()
-$slowApis = @()
-$transactions = @()
-$correlationMap = @{}
-$serviceHealth = @()
-
-# -------------------------
-# 3. Define regex patterns we want to match in each line
-# -------------------------
-# Simple substring match for "ERROR".
-$regexError = '\bERROR\b'
-
-# Timeout-related keywords typically seen in logs (case-insensitive).
-$regexTimeout = '(?i)timeout|Timedout|SCREEN_TIMEDOUT'
-
-# Pattern to capture the numeric value inside completeReqTTms="123".
-# The () defines a capturing group so we can extract just the number.
-$regexApi = 'completeReqTTms="(\d+)"'
-
-# Pattern for a standard UUID / GUID (correlation ID) – 8-4-4-4-12 hex (case-insensitive).
-$regexCorrelation = '\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b'
-
-# -------------------------
-# 4. Process log lines one by one
-# -------------------------
-foreach ($line in $logs) {
-
-    # A. Capture any line containing ERROR.
-    # -match returns $true if the pattern is found.
-    if ($line -match $regexError) {
-        $errors += $line
-    }
-
-    # B. Capture lines that indicate timeouts (screen or network).
-    if ($line -match $regexTimeout) {
-        $timeouts += $line
-    }
-
-    # C. Capture slow API calls.
-    # If completeReqTTms="number" exists, -match populates $Matches[1] with the numeric part.
-    if ($line -match $regexApi) {
-        # Cast the captured string to [int] so we can compare numerically.
-        $ms = [int]$Matches[1]
-        # Threshold for "slow" APIs is >300 ms (can be tuned later).
-        if (Is-SlowApi $ms) {
-            # Store both the latency and the full line for context.
-            $slowApis += "$ms ms : $line"
+        } catch {
+            # If JSON parsing fails, we silently ignore and let other detectors work.
         }
     }
 
-    # D. Capture correlation IDs so we can group related log lines.
-    if ($line -match $regexCorrelation) {
-        # $Matches[0] contains the full GUID that matched.
+    # -------------------------
+    # B. Plain-text errors
+    # -------------------------
+    # If the line matches generic error keywords, flag it as an error.
+    if ($line -match $script:regexError) {
+        $script:errors += $line
+    }
+
+    # -------------------------
+    # C. Timeouts
+    # -------------------------
+    # Matches lines indicating some form of timeout.
+    if ($line -match $script:regexTimeout) {
+        $script:timeouts += $line
+    }
+
+    # -------------------------
+    # D. API latency extraction
+    # -------------------------
+    # Extracts latency from patterns like completeReqTTms="644".
+    if ($line -match $script:regexApi) {
+        $ms = [int]$Matches[1]
+        # Only consider as “slow” if above our threshold (300ms).
+        if ($ms -gt 300) {
+            $script:slowApis += "$ms ms : $line"
+        }
+    }
+
+    # -------------------------
+    # E. Correlation ID mapping
+    # -------------------------
+    # This helps trace a single request across services by grouping lines by ID.
+    if ($line -match $script:regexCorrelation) {
         $cid = $Matches[0]
-        Add-ToMap -key $cid -line $line -map $correlationMap
+
+        if (-not $script:correlationMap.ContainsKey($cid)) {
+            $script:correlationMap[$cid] = @()
+        }
+        $script:correlationMap[$cid] += $line
     }
 
-    # E. Capture lines related to transaction lifecycle and payment.
-    # This is a simple OR pattern for key markers.
-    if ($line -match '(?i)TransactionType|TotalDetails|payment') {
-        $transactions += $line
-    }
-
-    # F. Capture lines that look like service health issues.
-    # These include failed localhost calls, statusCode="0", and explicit health flags.
-    if ($line -match '(?i)Failed to connect|statusCode="0"|Unable to connect|SyncServiceHealthy:false') {
-        $serviceHealth += $line
+    # -------------------------
+    # F. Service health detection
+    # -------------------------
+    # Any line that looks like connectivity or service health issue.
+    if ($line -match "Failed to connect|statusCode=""0""|Unable to connect|SyncServiceHealthy:false") {
+        $script:serviceHealth += $line
     }
 }
 
-# -------------------------
-# 5. Build a summary report object
-# -------------------------
-# Here we package all the counts and raw collections into a single PSCustomObject
-# so it can be output, converted to JSON, or turned into HTML in a structured way.
+# -----------------------------------------------------------------------------------
+# 3. TAIL MODE (REAL-TIME STREAMING)
+#    In tail mode we DON'T generate reports, we continuously analyze new lines.
+# -----------------------------------------------------------------------------------
+
+if ($Tail) {
+    # Ensure the path exists
+    if (-not (Test-Path $LogPath)) {
+        Write-Host "❌ Tail mode: Log path '$LogPath' does not exist." -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host "📡 Real-time monitoring enabled (tail mode). Press Ctrl+C to stop." -ForegroundColor Yellow
+
+    # Get-Content -Wait -Tail 50 behaves like `tail -f`, streaming new lines.
+    Get-Content $LogPath -Wait -Tail 50 | ForEach-Object { Process-Line $_ }
+
+    # No reports at the end; streaming only.
+    exit 0
+}
+
+# -----------------------------------------------------------------------------------
+# 4. LOAD LOGS (BATCH MODE)
+#    If LogPath is a directory, we pull all *.log files.
+#    If it is a file, we only read that file.
+# -----------------------------------------------------------------------------------
+
+if (Test-Path $LogPath -PathType Container) {
+    # Directory case: read all .log files under it (recursively).
+    $logs = Get-ChildItem -Path $LogPath -Filter *.log -Recurse |
+            ForEach-Object { Get-Content $_.FullName }
+} elseif (Test-Path $LogPath -PathType Leaf) {
+    # Single file case
+    $logs = Get-Content $LogPath
+} else {
+    Write-Host "❌ Log path '$LogPath' not found." -ForegroundColor Red
+    exit 1
+}
+
+# Process each line via the shared function
+foreach ($line in $logs) {
+    Process-Line $line
+}
+
+# -----------------------------------------------------------------------------------
+# 5. LATENCY METRICS (P50 / P90 / P99)
+#    Convert slowApi entries into numeric array and compute percentiles.
+# -----------------------------------------------------------------------------------
+
+$latencies = @()
+
+foreach ($entry in $script:slowApis) {
+    # Each slowApis entry looks like: "393 ms : <original log line>"
+    $msText = $entry.Split(" ")[0]
+    $ms = 0
+    [int]::TryParse($msText, [ref]$ms) | Out-Null
+    if ($ms -gt 0) { $latencies += $ms }
+}
+
+$p50 = $null; $p90 = $null; $p99 = $null
+
+if ($latencies.Count -gt 0) {
+    $sorted = $latencies | Sort-Object
+    # Use floor indices capped to last element to avoid out-of-range.
+    $p50 = $sorted[ [int]([Math]::Min($sorted.Count - 1, [Math]::Floor($sorted.Count * 0.50))) ]
+    $p90 = $sorted[ [int]([Math]::Min($sorted.Count - 1, [Math]::Floor($sorted.Count * 0.90))) ]
+    $p99 = $sorted[ [int]([Math]::Min($sorted.Count - 1, [Math]::Floor($sorted.Count * 0.99))) ]
+}
+
+# -----------------------------------------------------------------------------------
+# 6. ERROR GROUPING
+#    Group errors by first 80 chars to find recurring patterns (same message).
+# -----------------------------------------------------------------------------------
+
+$groupedErrors = $script:errors |
+    Group-Object { $_.Substring(0, [Math]::Min(80, $_.Length)) } |
+    Select-Object Name, Count |
+    Sort-Object Count -Descending
+
+# -----------------------------------------------------------------------------------
+# 7. BUILD MAIN REPORT OBJECT
+#    This is the in-memory summary used by JSON/HTML and also returned to console.
+# -----------------------------------------------------------------------------------
+
 $report = [PSCustomObject]@{
-    # When this analysis was run.
     Timestamp           = (Get-Date)
-
-    # Total number of log lines processed.
     TotalLines          = $logs.Count
-
-    # Aggregated counts for quick, high-level view.
-    ErrorCount          = $errors.Count
-    TimeoutCount        = $timeouts.Count
-    SlowApiCount        = $slowApis.Count
-    Transactions        = $transactions.Count
-
-    # How many distinct correlation IDs were found.
-    CorrelationIDs      = $correlationMap.Keys.Count
-
-    # Number of service health-related log entries.
-    ServiceHealthIssues = $serviceHealth.Count
-
-    # Detailed collections – useful for deeper drilldowns.
-    Errors              = $errors
-    Timeouts            = $timeouts
-    SlowApis            = $slowApis
-    ServiceHealth       = $serviceHealth
+    ErrorCount          = $script:errors.Count
+    TimeoutCount        = $script:timeouts.Count
+    SlowApiCount        = $script:slowApis.Count
+    CorrelationIDs      = $script:correlationMap.Keys.Count
+    ServiceHealthIssues = $script:serviceHealth.Count
+    P50LatencyMs        = $p50
+    P90LatencyMs        = $p90
+    P99LatencyMs        = $p99
+    Errors              = $script:errors
+    Timeouts            = $script:timeouts
+    SlowApis            = $script:slowApis
+    ServiceHealth       = $script:serviceHealth
+    GroupedErrors       = $groupedErrors
 }
 
-# -------------------------
-# 6. Emit output in the requested formats
-# -------------------------
+# -----------------------------------------------------------------------------------
+# 8. CSV REPORTS (MATCH YOUR EXISTING STRUCTURE)
+#    These produce the .csv files you already see in your repo.
+# -----------------------------------------------------------------------------------
 
-# If -JsonReport was passed, serialize the report object to JSON
-# and write it to a file named logiq-report.json in the current directory.
+# Summary CSV: one row with core metrics
+$summaryRow = [PSCustomObject]@{
+    Timestamp           = $report.Timestamp
+    TotalLines          = $report.TotalLines
+    ErrorCount          = $report.ErrorCount
+    TimeoutCount        = $report.TimeoutCount
+    SlowApiCount        = $report.SlowApiCount
+    ServiceHealthIssues = $report.ServiceHealthIssues
+    P50LatencyMs        = $report.P50LatencyMs
+    P90LatencyMs        = $report.P90LatencyMs
+    P99LatencyMs        = $report.P99LatencyMs
+}
+
+$summaryRow | Export-Csv "logiq-summary.csv" -NoTypeInformation -Encoding UTF8
+
+# Each error line as a row in logiq-errors.csv
+$report.Errors |
+    ForEach-Object { [PSCustomObject]@{ Line = $_ } } |
+    Export-Csv "logiq-errors.csv" -NoTypeInformation -Encoding UTF8
+
+# Each timeout line in logiq-timeouts.csv
+$report.Timeouts |
+    ForEach-Object { [PSCustomObject]@{ Line = $_ } } |
+    Export-Csv "logiq-timeouts.csv" -NoTypeInformation -Encoding UTF8
+
+# Each slow API line in logiq-slowapis.csv
+$report.SlowApis |
+    ForEach-Object { [PSCustomObject]@{ Line = $_ } } |
+    Export-Csv "logiq-slowapis.csv" -NoTypeInformation -Encoding UTF8
+
+# Each service health issue in logiq-servicehealth.csv
+$report.ServiceHealth |
+    ForEach-Object { [PSCustomObject]@{ Line = $_ } } |
+    Export-Csv "logiq-servicehealth.csv" -NoTypeInformation -Encoding UTF8
+
+Write-Host "📄 CSV reports generated: logiq-summary/errors/timeouts/slowapis/servicehealth.csv"
+
+# -----------------------------------------------------------------------------------
+# 9. JSON REPORT (OPTIONAL)
+# -----------------------------------------------------------------------------------
+
 if ($JsonReport) {
     $report | ConvertTo-Json -Depth 6 | Out-File "logiq-report.json"
     Write-Host "📄 JSON report generated: logiq-report.json"
 }
 
-# If -HtmlReport was passed, build the styled HTML dashboard and write it to a file
+# -----------------------------------------------------------------------------------
+# 10. STYLED HTML DASHBOARD (OPTION B + C MIX)
+#      Uses inline CSS for a dark, SRE-friendly visual summary.
+# -----------------------------------------------------------------------------------
+
 if ($HtmlReport) {
-    $html = Build-LogiqHtml -Report $report -Errors $errors -Timeouts $timeouts -SlowApis $slowApis -ServiceHealth $serviceHealth
-    $html | Out-File "logiq-report.html"
-    Write-Host "📄 HTML dashboard generated: logiq-report.html"
+    # Build small tables for summary + latency + grouped errors
+    $summaryData = @(
+        [PSCustomObject]@{ Metric = "Total Lines";      Value = $report.TotalLines }
+        [PSCustomObject]@{ Metric = "Errors";           Value = $report.ErrorCount }
+        [PSCustomObject]@{ Metric = "Timeouts";         Value = $report.TimeoutCount }
+        [PSCustomObject]@{ Metric = "Slow APIs";        Value = $report.SlowApiCount }
+        [PSCustomObject]@{ Metric = "Service Issues";   Value = $report.ServiceHealthIssues }
+        [PSCustomObject]@{ Metric = "Correlation IDs";  Value = $report.CorrelationIDs }
+    )
+
+    $latencyData = @(
+        [PSCustomObject]@{ Percentile = "P50"; Value = $report.P50LatencyMs }
+        [PSCustomObject]@{ Percentile = "P90"; Value = $report.P90LatencyMs }
+        [PSCustomObject]@{ Percentile = "P99"; Value = $report.P99LatencyMs }
+    )
+
+    $summaryHtml       = $summaryData        | ConvertTo-Html -Fragment
+    $latencyHtml       = $latencyData        | ConvertTo-Html -Fragment
+    $groupedErrorsHtml = $report.GroupedErrors | ConvertTo-Html -Fragment
+    $timestamp         = $report.Timestamp
+
+    # NOTE: we embed PowerShell variables ($report, etc.) into the here-string.
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>LogIQ Analysis Report</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: #020617;
+      color: #e5e7eb;
+      margin: 0;
+      padding: 0;
+    }
+    .page {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px 16px 40px;
+    }
+    h1, h2, h3 {
+      font-weight: 600;
+      color: #f9fafb;
+    }
+    h1 {
+      font-size: 28px;
+      margin-bottom: 4px;
+    }
+    h2 {
+      font-size: 20px;
+      margin-top: 24px;
+    }
+    .subtitle {
+      color: #9ca3af;
+      font-size: 13px;
+      margin-bottom: 20px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: radial-gradient(circle at top left, #1d283a, #020617 70%);
+      border-radius: 10px;
+      padding: 14px 16px;
+      border: 1px solid #1f2937;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    }
+    .card h3 {
+      font-size: 14px;
+      margin: 0 0 8px 0;
+      color: #e5e7eb;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .metric {
+      font-size: 24px;
+      font-weight: 600;
+    }
+    .metric--error {
+      color: #f97373;
+    }
+    .metric--warn {
+      color: #fbbf24;
+    }
+    .metric--ok {
+      color: #4ade80;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    th, td {
+      border: 1px solid #111827;
+      padding: 6px 8px;
+    }
+    th {
+      background-color: #0f172a;
+      color: #e5e7eb;
+      text-align: left;
+    }
+    tr:nth-child(even) td {
+      background-color: #020617;
+    }
+    tr:nth-child(odd) td {
+      background-color: #030712;
+    }
+    .section {
+      margin-top: 24px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 10px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-left: 8px;
+    }
+    .badge-error {
+      background-color: rgba(248,113,113,0.12);
+      color: #fecaca;
+      border: 1px solid rgba(248,113,113,0.5);
+    }
+    .badge-warn {
+      background-color: rgba(234,179,8,0.12);
+      color: #fef3c7;
+      border: 1px solid rgba(234,179,8,0.5);
+    }
+    .badge-info {
+      background-color: rgba(59,130,246,0.12);
+      color: #bfdbfe;
+      border: 1px solid rgba(59,130,246,0.5);
+    }
+    .footer {
+      margin-top: 32px;
+      font-size: 11px;
+      color: #6b7280;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>LogIQ Analysis Report</h1>
+      <div class="subtitle">
+        Generated at $timestamp · SRE-ready summary of log health and anomalies
+      </div>
+    </header>
+
+    <section class="grid">
+      <div class="card">
+        <h3>Errors</h3>
+        <div class="metric metric--error">$($report.ErrorCount)</div>
+        <div class="subtitle">Total error lines detected across all logs.</div>
+      </div>
+      <div class="card">
+        <h3>Timeouts</h3>
+        <div class="metric metric--warn">$($report.TimeoutCount)</div>
+        <div class="subtitle">User-facing or service timeouts observed.</div>
+      </div>
+      <div class="card">
+        <h3>Slow APIs</h3>
+        <div class="metric metric--warn">$($report.SlowApiCount)</div>
+        <div class="subtitle">Requests above threshold latency (&gt;300ms).</div>
+      </div>
+      <div class="card">
+        <h3>Service Health</h3>
+        <div class="metric $(if ($report.ServiceHealthIssues -gt 0) { 'metric--error' } else { 'metric--ok' })">
+          $($report.ServiceHealthIssues)
+        </div>
+        <div class="subtitle">Connectivity failures or unhealthy dependencies.</div>
+      </div>
+      <div class="card">
+        <h3>Correlation IDs</h3>
+        <div class="metric metric--ok">$($report.CorrelationIDs)</div>
+        <div class="subtitle">Unique traces discovered across services.</div>
+      </div>
+      <div class="card">
+        <h3>Total Lines</h3>
+        <div class="metric metric--ok">$($report.TotalLines)</div>
+        <div class="subtitle">Total log volume processed by LogIQ.</div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h3>Latency Percentiles</h3>
+        $latencyHtml
+      </div>
+      <div class="card">
+        <h3>Summary Metrics</h3>
+        $summaryHtml
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Grouped Errors <span class="badge badge-error">Top Patterns</span></h2>
+      $groupedErrorsHtml
+    </section>
+
+    <section class="section">
+      <h2>Service Health Issues <span class="badge badge-warn">Dependencies</span></h2>
+      @( $report.ServiceHealth | Select-Object -First 50 ) |
+        ConvertTo-Html -Fragment |
+        Out-String
+    </section>
+
+    <section class="section">
+      <h2>Slow API Calls <span class="badge badge-info">Top 50</span></h2>
+      @( $report.SlowApis | Select-Object -First 50 ) |
+        ConvertTo-Html -Fragment |
+        Out-String
+    </section>
+
+    <section class="section">
+      <h2>Raw Errors <span class="badge badge-error">First 50</span></h2>
+      @( $report.Errors | Select-Object -First 50 ) |
+        ConvertTo-Html -Fragment |
+        Out-String
+    </section>
+
+    <div class="footer">
+      LogIQ · Open-source log intelligence for DevOps &amp; SRE · Generated by PowerShell
+    </div>
+  </div>
+</body>
+</html>
+"@
+
+    $html | Out-File "logiq-report.html" -Encoding UTF8
+    Write-Host "📄 HTML report generated: logiq-report.html"
 }
 
-# If -CsvReport was passed, export key collections to CSV files
-if ($CsvReport) {
-    # Export summary (counts only)
-    $report | Select-Object Timestamp,TotalLines,ErrorCount,TimeoutCount,SlowApiCount,Transactions,CorrelationIDs,ServiceHealthIssues |
-        Export-Csv -NoTypeInformation -Path "logiq-summary.csv"
-
-    # Export individual collections
-    $errors      | Set-Content "logiq-errors.csv"
-    $timeouts    | Set-Content "logiq-timeouts.csv"
-    $slowApis    | Set-Content "logiq-slowapis.csv"
-    $serviceHealth | Set-Content "logiq-servicehealth.csv"
-
-    Write-Host "📄 CSV reports generated: logiq-summary.csv, logiq-errors.csv, logiq-timeouts.csv, logiq-slowapis.csv, logiq-servicehealth.csv"
-}
-
-
-# Default behavior: always print the report object to the console so
-# the user (or another script) can see and pipe the results.
-Write-Host "✔ LogIQ analysis completed."
+Write-Host "✔ Analysis Completed." -ForegroundColor Green
+# Also output the report object to console so pwsh shows a summary object
 $report
