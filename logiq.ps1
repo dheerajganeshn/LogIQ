@@ -1,38 +1,13 @@
 <#
 =====================================================================================
  LOGIQ — ENTERPRISE LOG ANALYZER
--------------------------------------------------------------------------------------
- This script analyzes ANY kind of application logs:
- - POS logs (7POS, SCO, Retail)
- - JSON logs (Datadog, ELK, Splunk)
- - Windows / Server logs
- - API performance logs
- - Kubernetes / Docker logs when redirected to files
-
- It extracts:
- - Errors & stack traces
- - Timeouts
- - Slow APIs (durationMs or completeReqTTms)
- - Correlation IDs
- - Service health failures
- - JSON structured logs (Datadog/ELK/Splunk)
- - Error grouping
- - Latency percentiles (P50, P90, P99)
- - HTML, JSON and CSV reports
-
- It also supports real-time tailing:  ./logiq.ps1 -LogPath app.log -Tail
-
 =====================================================================================
 #>
 
 param(
-    # Path to either a single log file or a directory containing .log files
     [string]$LogPath = ".",
-    # Whether to output a JSON summary report
     [switch]$JsonReport,
-    # Whether to output a styled HTML dashboard
     [switch]$HtmlReport,
-    # Enable real-time streaming analysis (no final report, just processing as logs arrive)
     [switch]$Tail
 )
 
@@ -40,37 +15,25 @@ Write-Host "`n🔍 Starting LogIQ Enterprise Log Analyzer..." -ForegroundColor C
 
 # -----------------------------------------------------------------------------------
 # 1. INITIALIZE BUCKETS & REGEX PATTERNS
-#    These script-scope variables hold everything we extract from logs.
 # -----------------------------------------------------------------------------------
 
-# Will store raw error lines
-$script:errors = @()
-# Will store timeout-related lines
-$script:timeouts = @()
-# Will store “slow API” entries (with duration and line)
-$script:slowApis = @()
-# Map of correlationId -> list of log lines containing that ID
+$script:errors         = @()
+$script:timeouts       = @()
+$script:slowApis       = @()
 $script:correlationMap = @{}
-# Placeholder if later you want transaction analysis
-$script:transactions = @()
-# Lines that indicate unhealthy services / connectivity issues
-$script:serviceHealth = @()
-# Parsed JSON objects from JSON logs (Datadog/ELK/etc.)
-$script:jsonEntries = @()
+$script:transactions   = @()
+$script:serviceHealth  = @()
+$script:jsonEntries    = @()
 
-# Regex to detect errors in plain text
-$script:regexError = "ERROR|Exception|Traceback"
-# Regex to detect timeouts
-$script:regexTimeout = "timeout|Timedout|SCREEN_TIMEDOUT"
-# Regex to capture numeric value from completeReqTTms="644"
-$script:regexApi = 'completeReqTTms="(\d+)"'
-# Regex to detect UUID-style correlation IDs
+$script:regexError       = "ERROR|Exception|Traceback"
+$script:regexTimeout     = "timeout|Timedout|SCREEN_TIMEDOUT"
+$script:regexApi         = 'completeReqTTms="(\d+)"'
 $script:regexCorrelation = '\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'
 
 # ---------------------------
 # PAYMENT + TRANSACTION FLOW
 # ---------------------------
-$script:transactionsFlow = @{}
+$script:transactionsFlow   = @{}
 $script:regexTransactionId = 'transactionId["\:]?\s*"?([0-9a-f-]{36})"?'
 $script:regexPapiReq       = "POST https://.*papi.*?/payments"
 $script:regexPapiResp      = '"statusCode"\s*:\s*(\d+).*"status"\s*:\s*"(\w+)"'
@@ -83,105 +46,76 @@ $script:regexScheduler     = "START schedule job"
 function Ensure-Transaction($tid) {
     if (-not $script:transactionsFlow.ContainsKey($tid)) {
         $script:transactionsFlow[$tid] = @{
-            TransactionId     = $tid
-            PapiRequest       = $false
-            PapiResponse      = $null
-            TapiRequest       = $false
-            TapiResponse      = $null
-            WebSocketDrop     = $false
-            ExceptionOffline  = $false
-            SchedulerJobs     = @()
-            Lines             = @()
+            TransactionId      = $tid
+            PapiRequest        = $false
+            PapiResponse       = $null
+            TapiRequest        = $false
+            TapiResponse       = $null
+            TapiKinesisSuccess = $false
+            WebSocketDrop      = $false
+            ExceptionOffline   = $false
+            SchedulerJobs      = @()
+            Lines              = @()
+            Abnormal           = $false
         }
     }
 }
 
 # -----------------------------------------------------------------------------------
 # 2. PER-LINE PROCESSOR
-#    This function does all logic for a SINGLE log line.
-#    It is reused by both batch mode and tail mode.
 # -----------------------------------------------------------------------------------
 
 function Process-Line {
-    param(
-        [string]$line  # raw log line
-    )
+    param([string]$line)
 
-    # Skip empty lines
     if (-not $line) { return }
 
-    # -------------------------
-    # A. JSON LOG HANDLING
-    # -------------------------
-    # If a line looks like JSON (starts with "{"), we try to parse it.
+    # JSON logs
     if ($line.Trim().StartsWith("{")) {
         try {
             $jsonObj = $line | ConvertFrom-Json
-            # Store JSON object for possible future queries
             $script:jsonEntries += $jsonObj
 
-            # Treat JSON logs as error if they have level=error or HTTP status=500
             if ($jsonObj.level -eq "error" -or $jsonObj.status -eq 500) {
                 $script:errors += $line
             }
 
-            # Some logs use durationMs for latency; classify slow ones > 300ms
             if ($jsonObj.PSObject.Properties.Name -contains "durationMs") {
                 if ([int]$jsonObj.durationMs -gt 300) {
                     $script:slowApis += "$($jsonObj.durationMs) ms : $line"
                 }
             }
-
-        } catch {
-            # If JSON parsing fails, we silently ignore and let other detectors work.
-        }
+        } catch { }
     }
 
-    # -------------------------
-    # B. Plain-text errors
-    # -------------------------
-    # If the line matches generic error keywords, flag it as an error.
+    # Plain errors
     if ($line -match $script:regexError) {
         $script:errors += $line
     }
 
-    # -------------------------
-    # C. Timeouts
-    # -------------------------
-    # Matches lines indicating some form of timeout.
+    # Timeouts
     if ($line -match $script:regexTimeout) {
         $script:timeouts += $line
     }
 
-    # -------------------------
-    # D. API latency extraction
-    # -------------------------
-    # Extracts latency from patterns like completeReqTTms="644".
+    # API latency
     if ($line -match $script:regexApi) {
         $ms = [int]$Matches[1]
-        # Only consider as “slow” if above our threshold (300ms).
         if ($ms -gt 300) {
             $script:slowApis += "$ms ms : $line"
         }
     }
 
-    # -------------------------
-    # E. Correlation ID mapping
-    # -------------------------
-    # This helps trace a single request across services by grouping lines by ID.
+    # Correlation IDs
     if ($line -match $script:regexCorrelation) {
         $cid = $Matches[0]
-
         if (-not $script:correlationMap.ContainsKey($cid)) {
             $script:correlationMap[$cid] = @()
         }
         $script:correlationMap[$cid] += $line
     }
 
-    # -------------------------
-    # F. Service health detection
-    # -------------------------
-    # Any line that looks like connectivity or service health issue.
+    # Service health
     if ($line -match "Failed to connect|statusCode=""0""|Unable to connect|SyncServiceHealthy:false") {
         $script:serviceHealth += $line
     }
@@ -190,22 +124,59 @@ function Process-Line {
     # PAYMENT + TRANSACTION ANALYSIS
     # ---------------------------------------------
     $tid = $null
+
+    # Case 1: explicit transactionId field
     if ($line -match $script:regexTransactionId) {
         $tid = $Matches[1]
+    }
+    # Case 2: standalone UUID in line (like 445e188c-...)
+    elseif ($line -match $script:regexCorrelation) {
+        $tid = $Matches[0]
+    }
+
+    if ($tid) {
         Ensure-Transaction $tid
         $script:transactionsFlow[$tid].Lines += $line
-    }
-    if ($tid) {
-        if ($line -match $script:regexPapiReq) { $script:transactionsFlow[$tid].PapiRequest = $true }
+
+        # PAPI Request
+        if ($line -match $script:regexPapiReq) {
+            $script:transactionsFlow[$tid].PapiRequest = $true
+        }
+
+        # PAPI Response
         if ($line -match $script:regexPapiResp) {
-            $code = [int]$Matches[1]; $status = $Matches[2]
+            $code   = [int]$Matches[1]
+            $status = $Matches[2]
             $script:transactionsFlow[$tid].PapiResponse = "$code $status"
         }
-        if ($line -match $script:regexTapiReq) { $script:transactionsFlow[$tid].TapiRequest = $true }
-        if ($line -match $script:regexTapiResp) { $script:transactionsFlow[$tid].TapiResponse = "201 SUCCESS" }
-        if ($line -match $script:regexWsDisconnect) { $script:transactionsFlow[$tid].WebSocketDrop = $true }
-        if ($line -match $script:regexExceptionTapi) { $script:transactionsFlow[$tid].ExceptionOffline = $true }
+
+        # TAPI Request
+        if ($line -match $script:regexTapiReq) {
+            $script:transactionsFlow[$tid].TapiRequest = $true
+        }
+
+        # TAPI Response (201)
+        if ($line -match $script:regexTapiResp) {
+            $script:transactionsFlow[$tid].TapiResponse = "201 SUCCESS"
+        }
+
+        # DynamoDB + Kinesis success
+        if ($line -match 'Documents successfully sent to kinesis and saved to DynamoDB') {
+            $script:transactionsFlow[$tid].TapiKinesisSuccess = $true
+        }
+
+        # WebSocket disconnect
+        if ($line -match $script:regexWsDisconnect) {
+            $script:transactionsFlow[$tid].WebSocketDrop = $true
+        }
+
+        # TAPI offline/exception
+        if ($line -match $script:regexExceptionTapi) {
+            $script:transactionsFlow[$tid].ExceptionOffline = $true
+        }
     }
+
+    # Scheduler logs apply globally
     if ($line -match $script:regexScheduler) {
         foreach ($id in $script:transactionsFlow.Keys) {
             $script:transactionsFlow[$id].SchedulerJobs += $line
@@ -214,58 +185,44 @@ function Process-Line {
 }
 
 # -----------------------------------------------------------------------------------
-# 3. TAIL MODE (REAL-TIME STREAMING)
-#    In tail mode we DON'T generate reports, we continuously analyze new lines.
+# 3. TAIL MODE
 # -----------------------------------------------------------------------------------
 
 if ($Tail) {
-    # Ensure the path exists
     if (-not (Test-Path $LogPath)) {
         Write-Host "❌ Tail mode: Log path '$LogPath' does not exist." -ForegroundColor Red
         exit 1
     }
 
     Write-Host "📡 Real-time monitoring enabled (tail mode). Press Ctrl+C to stop." -ForegroundColor Yellow
-
-    # Get-Content -Wait -Tail 50 behaves like `tail -f`, streaming new lines.
     Get-Content $LogPath -Wait -Tail 50 | ForEach-Object { Process-Line $_ }
-
-    # No reports at the end; streaming only.
     exit 0
 }
 
 # -----------------------------------------------------------------------------------
-# 4. LOAD LOGS (BATCH MODE)
-#    If LogPath is a directory, we pull all *.log files.
-#    If it is a file, we only read that file.
+# 4. LOAD LOGS (BATCH)
 # -----------------------------------------------------------------------------------
 
 if (Test-Path $LogPath -PathType Container) {
-    # Directory case: read all .log files under it (recursively).
-    $logs = Get-ChildItem -Path $LogPath -Filter *.log -Recurse |
+    $logs = Get-ChildItem -Path $LogPath -Include *.log, *.txt, *.out, *.json -Recurse |
             ForEach-Object { Get-Content $_.FullName }
 } elseif (Test-Path $LogPath -PathType Leaf) {
-    # Single file case
     $logs = Get-Content $LogPath
 } else {
     Write-Host "❌ Log path '$LogPath' not found." -ForegroundColor Red
     exit 1
 }
 
-# Process each line via the shared function
 foreach ($line in $logs) {
     Process-Line $line
 }
 
 # -----------------------------------------------------------------------------------
-# 5. LATENCY METRICS (P50 / P90 / P99)
-#    Convert slowApi entries into numeric array and compute percentiles.
+# 5. LATENCY METRICS
 # -----------------------------------------------------------------------------------
 
 $latencies = @()
-
 foreach ($entry in $script:slowApis) {
-    # Each slowApis entry looks like: "393 ms : <original log line>"
     $msText = $entry.Split(" ")[0]
     $ms = 0
     [int]::TryParse($msText, [ref]$ms) | Out-Null
@@ -273,10 +230,8 @@ foreach ($entry in $script:slowApis) {
 }
 
 $p50 = $null; $p90 = $null; $p99 = $null
-
 if ($latencies.Count -gt 0) {
     $sorted = $latencies | Sort-Object
-    # Use floor indices capped to last element to avoid out-of-range.
     $p50 = $sorted[ [int]([Math]::Min($sorted.Count - 1, [Math]::Floor($sorted.Count * 0.50))) ]
     $p90 = $sorted[ [int]([Math]::Min($sorted.Count - 1, [Math]::Floor($sorted.Count * 0.90))) ]
     $p99 = $sorted[ [int]([Math]::Min($sorted.Count - 1, [Math]::Floor($sorted.Count * 0.99))) ]
@@ -284,7 +239,6 @@ if ($latencies.Count -gt 0) {
 
 # -----------------------------------------------------------------------------------
 # 6. ERROR GROUPING
-#    Group errors by first 80 chars to find recurring patterns (same message).
 # -----------------------------------------------------------------------------------
 
 $groupedErrors = $script:errors |
@@ -293,8 +247,77 @@ $groupedErrors = $script:errors |
     Sort-Object Count -Descending
 
 # -----------------------------------------------------------------------------------
-# 7. BUILD MAIN REPORT OBJECT
-#    This is the in-memory summary used by JSON/HTML and also returned to console.
+# 7. TRANSACTION FLOW SUMMARY + PER-TX LOGS
+# -----------------------------------------------------------------------------------
+
+$transactionSummaries = @()
+
+foreach ($tid in $script:transactionsFlow.Keys) {
+    $t = $script:transactionsFlow[$tid]
+
+    $root = "UNKNOWN"
+
+    if (-not $t.PapiRequest) {
+        $root = "Missing PAPI Request"
+    }
+    elseif (-not $t.PapiResponse) {
+        $root = "Missing PAPI Response"
+    }
+    elseif ($t.WebSocketDrop) {
+        $root = "WebSocket Disconnect between PAPI & TAPI"
+    }
+    elseif (-not $t.TapiRequest) {
+        $root = "Missing TAPI Request"
+    }
+    elseif (-not $t.TapiResponse) {
+        if ($t.ExceptionOffline) { $root = "TAPI sent to Offline Table" }
+        else { $root = "Missing TAPI Response" }
+    }
+    elseif ($t.TapiResponse -eq "201 SUCCESS" -and $t.TapiKinesisSuccess) {
+        $root = "OK"
+    }
+    elseif ($t.TapiResponse -eq "201 SUCCESS" -and -not $t.TapiKinesisSuccess) {
+        $root = "Missing Kinesis + DynamoDB Success Message"
+    }
+
+    $txObj = [PSCustomObject]@{
+        TransactionId       = $tid
+        PAPI                = $t.PapiResponse
+        TAPI                = $t.TapiResponse
+        TapiKinesisSuccess  = if ($t.TapiKinesisSuccess) { "YES" } else { "NO" }
+        WebSocket           = if ($t.WebSocketDrop) { "Disconnected" } else { "OK" }
+        OfflineHandling     = $t.ExceptionOffline
+        SchedulerJobs       = $t.SchedulerJobs.Count
+        RootCause           = $root
+    }
+
+    $abnormal = $false
+    if ($root -ne "OK") { $abnormal = $true }
+    if ($t.SchedulerJobs.Count -eq 0 -and $t.ExceptionOffline) { $abnormal = $true }
+    if ($t.PapiResponse -match '^4' -or $t.PapiResponse -match '^5') { $abnormal = $true }
+    if ($t.TapiResponse -match '^4' -or $t.TapiResponse -match '^5') { $abnormal = $true }
+
+    $t.Abnormal = $abnormal
+    $transactionSummaries += $txObj
+}
+
+# Success / Failed lists (used in CSV + HTML)
+$successTx = $transactionSummaries | Where-Object { $_.RootCause -eq "OK" }
+$failedTx  = $transactionSummaries | Where-Object { $_.RootCause -ne "OK" }
+
+# Per-transaction grouped logs (TX ID + line)
+$transactionLogRows = @()
+foreach ($tid in $script:transactionsFlow.Keys) {
+    foreach ($l in $script:transactionsFlow[$tid].Lines) {
+        $transactionLogRows += [PSCustomObject]@{
+            TransactionId = $tid
+            Line          = $l
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------------
+# 8. BUILD MAIN REPORT OBJECT
 # -----------------------------------------------------------------------------------
 
 $report = [PSCustomObject]@{
@@ -315,51 +338,13 @@ $report = [PSCustomObject]@{
     GroupedErrors       = $groupedErrors
 }
 
-# ---------------------------------------------------------------
-# TRANSACTION FLOW SUMMARY
-# ---------------------------------------------------------------
-$transactionSummaries = @()
-foreach ($tid in $script:transactionsFlow.Keys) {
-    $t = $script:transactionsFlow[$tid]
-    $root = "UNKNOWN"
-    if (-not $t.PapiRequest) { $root = "Missing PAPI Request" }
-    elseif (-not $t.PapiResponse) { $root = "Missing PAPI Response" }
-    elseif ($t.WebSocketDrop) { $root = "WebSocket Disconnect between PAPI & TAPI" }
-    elseif (-not $t.TapiRequest) { $root = "Missing TAPI Request" }
-    elseif (-not $t.TapiResponse) {
-        if ($t.ExceptionOffline) { $root = "TAPI sent to Offline Table" }
-        else { $root = "Missing TAPI Response" }
-    }
-    elseif ($t.TapiResponse -eq "201 SUCCESS") { $root = "OK" }
-
-    $transactionSummaries += [PSCustomObject]@{
-        TransactionId    = $tid
-        PAPI             = $t.PapiResponse
-        TAPI             = $t.TapiResponse
-        WebSocket        = if ($t.WebSocketDrop) { "Disconnected" } else { "OK" }
-        OfflineHandling  = $t.ExceptionOffline
-        SchedulerJobs    = $t.SchedulerJobs.Count
-        RootCause        = $root
-    }
-
-    # Detect abnormal transactions
-    $abnormal = $false
-    if ($root -ne "OK") { $abnormal = $true }
-    if ($t.SchedulerJobs.Count -eq 0 -and $t.ExceptionOffline) { $abnormal = $true }
-    if ($t.PapiResponse -match "^4" -or $t.PapiResponse -match "^5") { $abnormal = $true }
-    if ($t.TapiResponse -match "^4" -or $t.TapiResponse -match "^5") { $abnormal = $true }
-
-    $t.Abnormal = $abnormal
-}
- $report | Add-Member -MemberType NoteProperty -Name TransactionFlow -Value $transactionSummaries
-$report | Add-Member -MemberType NoteProperty -Name AbnormalTransactions -Value ($transactionSummaries | Where-Object { $_.RootCause -ne "OK" })
+$report | Add-Member -MemberType NoteProperty -Name TransactionFlow       -Value $transactionSummaries
+$report | Add-Member -MemberType NoteProperty -Name AbnormalTransactions -Value $failedTx
 
 # -----------------------------------------------------------------------------------
-# 8. CSV REPORTS (MATCH YOUR EXISTING STRUCTURE)
-#    These produce the .csv files you already see in your repo.
+# 9. CSV REPORTS (SUCCESS, FAILED, PER-TX LOGS)
 # -----------------------------------------------------------------------------------
 
-# Summary CSV: one row with core metrics
 $summaryRow = [PSCustomObject]@{
     Timestamp           = $report.Timestamp
     TotalLines          = $report.TotalLines
@@ -374,38 +359,47 @@ $summaryRow = [PSCustomObject]@{
 
 $summaryRow | Export-Csv "logiq-summary.csv" -NoTypeInformation -Encoding UTF8
 
-# Each error line as a row in logiq-errors.csv
 $report.Errors |
     ForEach-Object { [PSCustomObject]@{ Line = $_ } } |
     Export-Csv "logiq-errors.csv" -NoTypeInformation -Encoding UTF8
 
-# Each timeout line in logiq-timeouts.csv
 $report.Timeouts |
     ForEach-Object { [PSCustomObject]@{ Line = $_ } } |
     Export-Csv "logiq-timeouts.csv" -NoTypeInformation -Encoding UTF8
 
-# Each slow API line in logiq-slowapis.csv
 $report.SlowApis |
     ForEach-Object { [PSCustomObject]@{ Line = $_ } } |
     Export-Csv "logiq-slowapis.csv" -NoTypeInformation -Encoding UTF8
 
-# Each service health issue in logiq-servicehealth.csv
 $report.ServiceHealth |
     ForEach-Object { [PSCustomObject]@{ Line = $_ } } |
     Export-Csv "logiq-servicehealth.csv" -NoTypeInformation -Encoding UTF8
 
-# Transaction flow CSV
+# Per-transaction summary
 $transactionSummaries |
     Export-Csv "logiq-transactions.csv" -NoTypeInformation -Encoding UTF8
 
-$transactionSummaries |
-    Where-Object { $_.RootCause -ne "OK" } |
-    Export-Csv "logiq-abnormal-transactions.csv" -NoTypeInformation -Encoding UTF8
+# Success list
+$successTx |
+    Export-Csv "logiq-success-transactions.csv" -NoTypeInformation -Encoding UTF8
 
-Write-Host "📄 CSV reports generated: logiq-summary/errors/timeouts/slowapis/servicehealth.csv"
+# Failed list
+$failedTx |
+    Export-Csv "logiq-failed-transactions.csv" -NoTypeInformation -Encoding UTF8
+
+# Transactions missing DynamoDB+Kinesis success
+$transactionSummaries |
+    Where-Object { $_.RootCause -eq "Missing Kinesis + DynamoDB Success Message" } |
+    Export-Csv "logiq-tapi-missing-dynamodb.csv" -NoTypeInformation -Encoding UTF8
+
+# Per-transaction grouped logs
+$transactionLogRows |
+    Export-Csv "logiq-transaction-logs.csv" -NoTypeInformation -Encoding UTF8
+
+Write-Host "📄 CSV reports generated: summary/errors/timeouts/slowapis/servicehealth/transactions*.csv"
 
 # -----------------------------------------------------------------------------------
-# 9. JSON REPORT (OPTIONAL)
+# 10. JSON REPORT (OPTIONAL)
 # -----------------------------------------------------------------------------------
 
 if ($JsonReport) {
@@ -414,12 +408,11 @@ if ($JsonReport) {
 }
 
 # -----------------------------------------------------------------------------------
-# 10. STYLED HTML DASHBOARD (OPTION B + C MIX)
-#      Uses inline CSS for a dark, SRE-friendly visual summary.
+# 11. HTML DASHBOARD (SUCCESS / FAILED / PER-TX LOGS)
 # -----------------------------------------------------------------------------------
 
 if ($HtmlReport) {
-    # Build small tables for summary + latency + grouped errors
+
     $summaryData = @(
         [PSCustomObject]@{ Metric = "Total Lines";      Value = $report.TotalLines }
         [PSCustomObject]@{ Metric = "Errors";           Value = $report.ErrorCount }
@@ -435,12 +428,34 @@ if ($HtmlReport) {
         [PSCustomObject]@{ Percentile = "P99"; Value = $report.P99LatencyMs }
     )
 
-    $summaryHtml       = $summaryData        | ConvertTo-Html -Fragment
-    $latencyHtml       = $latencyData        | ConvertTo-Html -Fragment
-    $groupedErrorsHtml = $report.GroupedErrors | ConvertTo-Html -Fragment
-    $timestamp         = $report.Timestamp
+    $summaryHtml        = $summaryData         | ConvertTo-Html -Fragment | Out-String
+    $latencyHtml        = $latencyData         | ConvertTo-Html -Fragment | Out-String
+    $groupedErrorsHtml  = $report.GroupedErrors | ConvertTo-Html -Fragment | Out-String
 
-    # NOTE: we embed PowerShell variables ($report, etc.) into the here-string.
+    $successCount = $successTx.Count
+    $failedCount  = $failedTx.Count
+    $totalTx      = $transactionSummaries.Count
+
+    $successTxHtml = if ($successTx.Count -gt 0) {
+        ($successTx |
+            Select-Object TransactionId,PAPI,TAPI,TapiKinesisSuccess,WebSocket,OfflineHandling,RootCause |
+            ConvertTo-Html -Fragment | Out-String)
+    } else { "<p>No successful transactions.</p>" }
+
+    $failedTxHtml = if ($failedTx.Count -gt 0) {
+        ($failedTx |
+            Select-Object TransactionId,PAPI,TAPI,TapiKinesisSuccess,WebSocket,OfflineHandling,RootCause |
+            ConvertTo-Html -Fragment | Out-String)
+    } else { "<p>No failed transactions.</p>" }
+
+    # Per-transaction logs (first N rows to keep HTML reasonable)
+    $txLogsSample = $transactionLogRows | Select-Object TransactionId, Line -First 200
+    $transactionLogsHtml = if ($txLogsSample.Count -gt 0) {
+        ($txLogsSample | ConvertTo-Html -Fragment | Out-String)
+    } else { "<p>No transaction logs captured.</p>" }
+
+    $timestamp = $report.Timestamp
+
     $html = @"
 <!DOCTYPE html>
 <html lang="en">
@@ -464,14 +479,8 @@ if ($HtmlReport) {
       font-weight: 600;
       color: #f9fafb;
     }
-    h1 {
-      font-size: 28px;
-      margin-bottom: 4px;
-    }
-    h2 {
-      font-size: 20px;
-      margin-top: 24px;
-    }
+    h1 { font-size: 28px; margin-bottom: 4px; }
+    h2 { font-size: 20px; margin-top: 24px; }
     .subtitle {
       color: #9ca3af;
       font-size: 13px;
@@ -501,15 +510,9 @@ if ($HtmlReport) {
       font-size: 24px;
       font-weight: 600;
     }
-    .metric--error {
-      color: #f97373;
-    }
-    .metric--warn {
-      color: #fbbf24;
-    }
-    .metric--ok {
-      color: #4ade80;
-    }
+    .metric--error { color: #f97373; }
+    .metric--warn  { color: #fbbf24; }
+    .metric--ok    { color: #4ade80; }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -525,15 +528,9 @@ if ($HtmlReport) {
       color: #e5e7eb;
       text-align: left;
     }
-    tr:nth-child(even) td {
-      background-color: #020617;
-    }
-    tr:nth-child(odd) td {
-      background-color: #030712;
-    }
-    .section {
-      margin-top: 24px;
-    }
+    tr:nth-child(even) td { background-color: #020617; }
+    tr:nth-child(odd)  td { background-color: #030712; }
+    .section { margin-top: 24px; }
     .badge {
       display: inline-block;
       padding: 2px 8px;
@@ -543,21 +540,9 @@ if ($HtmlReport) {
       text-transform: uppercase;
       margin-left: 8px;
     }
-    .badge-error {
-      background-color: rgba(248,113,113,0.12);
-      color: #fecaca;
-      border: 1px solid rgba(248,113,113,0.5);
-    }
-    .badge-warn {
-      background-color: rgba(234,179,8,0.12);
-      color: #fef3c7;
-      border: 1px solid rgba(234,179,8,0.5);
-    }
-    .badge-info {
-      background-color: rgba(59,130,246,0.12);
-      color: #bfdbfe;
-      border: 1px solid rgba(59,130,246,0.5);
-    }
+    .badge-error { background-color: rgba(248,113,113,0.12); color: #fecaca; border: 1px solid rgba(248,113,113,0.5); }
+    .badge-warn  { background-color: rgba(234,179,8,0.12);  color: #fef3c7; border: 1px solid rgba(234,179,8,0.5); }
+    .badge-info  { background-color: rgba(59,130,246,0.12); color: #bfdbfe; border: 1px solid rgba(59,130,246,0.5); }
     .footer {
       margin-top: 32px;
       font-size: 11px;
@@ -579,34 +564,34 @@ if ($HtmlReport) {
       <div class="card">
         <h3>Errors</h3>
         <div class="metric metric--error">$($report.ErrorCount)</div>
-        <div class="subtitle">Total error lines detected across all logs.</div>
+        <div class="subtitle">Total error lines detected.</div>
       </div>
       <div class="card">
         <h3>Timeouts</h3>
         <div class="metric metric--warn">$($report.TimeoutCount)</div>
-        <div class="subtitle">User-facing or service timeouts observed.</div>
+        <div class="subtitle">Timeout-related log entries.</div>
       </div>
       <div class="card">
         <h3>Slow APIs</h3>
         <div class="metric metric--warn">$($report.SlowApiCount)</div>
-        <div class="subtitle">Requests above threshold latency (&gt;300ms).</div>
+        <div class="subtitle">Requests above latency threshold.</div>
       </div>
       <div class="card">
         <h3>Service Health</h3>
         <div class="metric $(if ($report.ServiceHealthIssues -gt 0) { 'metric--error' } else { 'metric--ok' })">
           $($report.ServiceHealthIssues)
         </div>
-        <div class="subtitle">Connectivity failures or unhealthy dependencies.</div>
+        <div class="subtitle">Connectivity / dependency issues.</div>
       </div>
       <div class="card">
-        <h3>Correlation IDs</h3>
-        <div class="metric metric--ok">$($report.CorrelationIDs)</div>
-        <div class="subtitle">Unique traces discovered across services.</div>
+        <h3>Transactions (OK / Failed)</h3>
+        <div class="metric metric--ok">$successCount / $failedCount</div>
+        <div class="subtitle">$totalTx total transactions traced.</div>
       </div>
       <div class="card">
         <h3>Total Lines</h3>
         <div class="metric metric--ok">$($report.TotalLines)</div>
-        <div class="subtitle">Total log volume processed by LogIQ.</div>
+        <div class="subtitle">Total log volume processed.</div>
       </div>
     </section>
 
@@ -627,28 +612,22 @@ if ($HtmlReport) {
     </section>
 
     <section class="section">
-      <h2>Service Health Issues <span class="badge badge-warn">Dependencies</span></h2>
-      @( $report.ServiceHealth | Select-Object -First 50 ) |
-        ConvertTo-Html -Fragment |
-        Out-String
+      <h2>Successful Transactions <span class="badge badge-info">RootCause = OK</span></h2>
+      $successTxHtml
     </section>
 
     <section class="section">
-      <h2>Slow API Calls <span class="badge badge-info">Top 50</span></h2>
-      @( $report.SlowApis | Select-Object -First 50 ) |
-        ConvertTo-Html -Fragment |
-        Out-String
+      <h2>Failed Transactions <span class="badge badge-error">RootCause != OK</span></h2>
+      $failedTxHtml
     </section>
 
     <section class="section">
-      <h2>Raw Errors <span class="badge badge-error">First 50</span></h2>
-      @( $report.Errors | Select-Object -First 50 ) |
-        ConvertTo-Html -Fragment |
-        Out-String
+      <h2>Per-Transaction Logs <span class="badge badge-info">First 200 Lines</span></h2>
+      $transactionLogsHtml
     </section>
 
     <div class="footer">
-      LogIQ · Open-source log intelligence for DevOps &amp; SRE · Generated by PowerShell by DG
+      LogIQ · Log intelligence for DevOps &amp; SRE · Generated by PowerShell
     </div>
   </div>
 </body>
@@ -660,5 +639,4 @@ if ($HtmlReport) {
 }
 
 Write-Host "✔ Analysis Completed." -ForegroundColor Green
-# Also output the report object to console so pwsh shows a summary object
 $report
