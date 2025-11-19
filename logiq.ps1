@@ -67,6 +67,35 @@ $script:regexApi = 'completeReqTTms="(\d+)"'
 # Regex to detect UUID-style correlation IDs
 $script:regexCorrelation = '\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'
 
+# ---------------------------
+# PAYMENT + TRANSACTION FLOW
+# ---------------------------
+$script:transactionsFlow = @{}
+$script:regexTransactionId = 'transactionId["\:]?\s*"?([0-9a-f-]{36})"?'
+$script:regexPapiReq       = "POST https://.*papi.*?/payments"
+$script:regexPapiResp      = '"statusCode"\s*:\s*(\d+).*"status"\s*:\s*"(\w+)"'
+$script:regexTapiReq       = "POST https://.*risservices.*?/sale/transaction"
+$script:regexTapiResp      = '"statusCode"\s*:\s*(\d+).*"SUCCESS"'
+$script:regexWsDisconnect  = "Websocket Session Disconnected|websocket disconnected"
+$script:regexExceptionTapi = "exceptionOfflineTransaction|Offline Transaction API Payload"
+$script:regexScheduler     = "START schedule job"
+
+function Ensure-Transaction($tid) {
+    if (-not $script:transactionsFlow.ContainsKey($tid)) {
+        $script:transactionsFlow[$tid] = @{
+            TransactionId     = $tid
+            PapiRequest       = $false
+            PapiResponse      = $null
+            TapiRequest       = $false
+            TapiResponse      = $null
+            WebSocketDrop     = $false
+            ExceptionOffline  = $false
+            SchedulerJobs     = @()
+            Lines             = @()
+        }
+    }
+}
+
 # -----------------------------------------------------------------------------------
 # 2. PER-LINE PROCESSOR
 #    This function does all logic for a SINGLE log line.
@@ -155,6 +184,32 @@ function Process-Line {
     # Any line that looks like connectivity or service health issue.
     if ($line -match "Failed to connect|statusCode=""0""|Unable to connect|SyncServiceHealthy:false") {
         $script:serviceHealth += $line
+    }
+
+    # ---------------------------------------------
+    # PAYMENT + TRANSACTION ANALYSIS
+    # ---------------------------------------------
+    $tid = $null
+    if ($line -match $script:regexTransactionId) {
+        $tid = $Matches[1]
+        Ensure-Transaction $tid
+        $script:transactionsFlow[$tid].Lines += $line
+    }
+    if ($tid) {
+        if ($line -match $script:regexPapiReq) { $script:transactionsFlow[$tid].PapiRequest = $true }
+        if ($line -match $script:regexPapiResp) {
+            $code = [int]$Matches[1]; $status = $Matches[2]
+            $script:transactionsFlow[$tid].PapiResponse = "$code $status"
+        }
+        if ($line -match $script:regexTapiReq) { $script:transactionsFlow[$tid].TapiRequest = $true }
+        if ($line -match $script:regexTapiResp) { $script:transactionsFlow[$tid].TapiResponse = "201 SUCCESS" }
+        if ($line -match $script:regexWsDisconnect) { $script:transactionsFlow[$tid].WebSocketDrop = $true }
+        if ($line -match $script:regexExceptionTapi) { $script:transactionsFlow[$tid].ExceptionOffline = $true }
+    }
+    if ($line -match $script:regexScheduler) {
+        foreach ($id in $script:transactionsFlow.Keys) {
+            $script:transactionsFlow[$id].SchedulerJobs += $line
+        }
     }
 }
 
@@ -260,6 +315,45 @@ $report = [PSCustomObject]@{
     GroupedErrors       = $groupedErrors
 }
 
+# ---------------------------------------------------------------
+# TRANSACTION FLOW SUMMARY
+# ---------------------------------------------------------------
+$transactionSummaries = @()
+foreach ($tid in $script:transactionsFlow.Keys) {
+    $t = $script:transactionsFlow[$tid]
+    $root = "UNKNOWN"
+    if (-not $t.PapiRequest) { $root = "Missing PAPI Request" }
+    elseif (-not $t.PapiResponse) { $root = "Missing PAPI Response" }
+    elseif ($t.WebSocketDrop) { $root = "WebSocket Disconnect between PAPI & TAPI" }
+    elseif (-not $t.TapiRequest) { $root = "Missing TAPI Request" }
+    elseif (-not $t.TapiResponse) {
+        if ($t.ExceptionOffline) { $root = "TAPI sent to Offline Table" }
+        else { $root = "Missing TAPI Response" }
+    }
+    elseif ($t.TapiResponse -eq "201 SUCCESS") { $root = "OK" }
+
+    $transactionSummaries += [PSCustomObject]@{
+        TransactionId    = $tid
+        PAPI             = $t.PapiResponse
+        TAPI             = $t.TapiResponse
+        WebSocket        = if ($t.WebSocketDrop) { "Disconnected" } else { "OK" }
+        OfflineHandling  = $t.ExceptionOffline
+        SchedulerJobs    = $t.SchedulerJobs.Count
+        RootCause        = $root
+    }
+
+    # Detect abnormal transactions
+    $abnormal = $false
+    if ($root -ne "OK") { $abnormal = $true }
+    if ($t.SchedulerJobs.Count -eq 0 -and $t.ExceptionOffline) { $abnormal = $true }
+    if ($t.PapiResponse -match "^4" -or $t.PapiResponse -match "^5") { $abnormal = $true }
+    if ($t.TapiResponse -match "^4" -or $t.TapiResponse -match "^5") { $abnormal = $true }
+
+    $t.Abnormal = $abnormal
+}
+ $report | Add-Member -MemberType NoteProperty -Name TransactionFlow -Value $transactionSummaries
+$report | Add-Member -MemberType NoteProperty -Name AbnormalTransactions -Value ($transactionSummaries | Where-Object { $_.RootCause -ne "OK" })
+
 # -----------------------------------------------------------------------------------
 # 8. CSV REPORTS (MATCH YOUR EXISTING STRUCTURE)
 #    These produce the .csv files you already see in your repo.
@@ -299,6 +393,14 @@ $report.SlowApis |
 $report.ServiceHealth |
     ForEach-Object { [PSCustomObject]@{ Line = $_ } } |
     Export-Csv "logiq-servicehealth.csv" -NoTypeInformation -Encoding UTF8
+
+# Transaction flow CSV
+$transactionSummaries |
+    Export-Csv "logiq-transactions.csv" -NoTypeInformation -Encoding UTF8
+
+$transactionSummaries |
+    Where-Object { $_.RootCause -ne "OK" } |
+    Export-Csv "logiq-abnormal-transactions.csv" -NoTypeInformation -Encoding UTF8
 
 Write-Host "📄 CSV reports generated: logiq-summary/errors/timeouts/slowapis/servicehealth.csv"
 
@@ -546,7 +648,7 @@ if ($HtmlReport) {
     </section>
 
     <div class="footer">
-      LogIQ · Open-source log intelligence for DevOps &amp; SRE · Generated by PowerShell
+      LogIQ · Open-source log intelligence for DevOps &amp; SRE · Generated by PowerShell by DG
     </div>
   </div>
 </body>
